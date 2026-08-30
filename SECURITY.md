@@ -6,10 +6,12 @@ exploit, application password, database export, or identifiable site data.
 
 ## Credential boundary
 
-The SiteCharter connection key is public by design. The WordPress application
-password is the credential protecting the connector's privileged routes.
-Create a dedicated password for SiteCharter, transmit it only to the intended
-SiteCharter workspace, and revoke it when the connection is removed.
+The SiteCharter connection key is public by design. The plugin creates a
+dedicated integration account whose WordPress application password protects
+the connector's privileged routes. The account is constrained to posts, pages,
+media, cache flushing, and database export; it cannot manage users, plugins,
+themes, or general WordPress settings. Transmit the password only to the
+intended SiteCharter workspace and revoke it when the connection is removed.
 
 The database export is content-complete and can contain users, password hashes,
 configuration, plugin data, and personal information. Store it with the same
@@ -19,4 +21,3 @@ care as a production database backup.
 
 Security fixes are applied to the latest release. The current minimums are
 WordPress 6.4 and PHP 8.0.
-

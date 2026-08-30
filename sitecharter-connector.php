@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteCharter Connector
  * Description: Connects this WordPress site to SiteCharter for bounded editing, cache flushing, database backup, and public verification.
- * Version: 0.1.0
+ * Version: 0.1.1
  * Requires at least: 6.4
  * Requires PHP: 8.0
  * Author: SiteCharter
@@ -15,8 +15,9 @@
  *  - The connection key is a public identifier. It is printed in page markup
  *    for public verification and must not be described as a secret.
  *  - Admin actions in wp-admin additionally require manage_options.
- *  - REST endpoints require an administrator's WordPress application password.
- *    The public connection key provides routing/binding, not a second secret.
+ *  - REST endpoints require an application password for the dedicated,
+ *    least-privilege SiteCharter integration account.
+ *  - The public connection key provides routing/binding, not a second secret.
  */
 
 if (!defined('ABSPATH')) {
@@ -26,6 +27,32 @@ if (!defined('ABSPATH')) {
 const SITECHARTER_OPTION_KEY_HASH = 'sitecharter_key_hash';
 const SITECHARTER_OPTION_KEY_RAW = 'sitecharter_key_raw';
 const SITECHARTER_OPTION_HOSTNAME = 'sitecharter_hostname';
+const SITECHARTER_OPTION_USER_ID = 'sitecharter_integration_user_id';
+const SITECHARTER_ROLE = 'sitecharter_integration';
+const SITECHARTER_CAPABILITY = 'sitecharter_connect';
+
+function sitecharter_register_role(): void {
+	add_role(SITECHARTER_ROLE, 'SiteCharter Integration', [
+		'read' => true,
+		'upload_files' => true,
+		'edit_posts' => true,
+		'edit_others_posts' => true,
+		'edit_published_posts' => true,
+		'publish_posts' => true,
+		'edit_pages' => true,
+		'edit_others_pages' => true,
+		'edit_published_pages' => true,
+		'publish_pages' => true,
+		SITECHARTER_CAPABILITY => true,
+	]);
+}
+
+register_activation_hook(__FILE__, 'sitecharter_register_role');
+
+// Plugin updates do not run activation hooks. Repair a missing role lazily.
+if (get_role(SITECHARTER_ROLE) === null) {
+	sitecharter_register_role();
+}
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -48,6 +75,38 @@ function sitecharter_key_matches(string $candidate): bool {
 /** The registered hostname of THIS site, as SiteCharter knows it. */
 function sitecharter_own_host(): string {
 	return (string) parse_url(home_url(), PHP_URL_HOST);
+}
+
+/** Return the dedicated integration user, creating it without admin rights. */
+function sitecharter_integration_user_id(): int|WP_Error {
+	$stored = (int) get_option(SITECHARTER_OPTION_USER_ID, 0);
+	if ($stored > 0) {
+		$user = get_user_by('id', $stored);
+		if ($user instanceof WP_User && in_array(SITECHARTER_ROLE, $user->roles, true)) {
+			return $stored;
+		}
+	}
+
+	$base = 'sitecharter-connector';
+	$login = $base;
+	$suffix = 1;
+	while (username_exists($login)) {
+		$login = $base . '-' . $suffix;
+		$suffix++;
+	}
+
+	$user_id = wp_insert_user([
+		'user_login' => $login,
+		'user_pass' => wp_generate_password(32, true, true),
+		'display_name' => 'SiteCharter Connector',
+		'role' => SITECHARTER_ROLE,
+	]);
+	if (is_wp_error($user_id)) {
+		return $user_id;
+	}
+
+	update_option(SITECHARTER_OPTION_USER_ID, (int) $user_id, false);
+	return (int) $user_id;
 }
 
 /* ─────────────────────────── admin UI ─────────────────────────── */
@@ -82,20 +141,30 @@ add_action('admin_init', function () {
 		},
 	]);
 
-	// Mint an application password named for this integration. Shown once.
+	// Mint an application password for the constrained integration user. Shown once.
 	if (
 		($_POST['sitecharter_action'] ?? '') === 'mint_app_password'
 		&& check_admin_referer('sitecharter_mint')
 	) {
-		$result = WP_Application_Passwords::create_new_application_password(
-			get_current_user_id(),
-			['name' => 'SiteCharter Connector']
-		);
+		$user_id = sitecharter_integration_user_id();
+		if (!is_wp_error($user_id)) {
+			WP_Application_Passwords::delete_all_application_passwords($user_id);
+		}
+		$result = is_wp_error($user_id)
+			? $user_id
+			: WP_Application_Passwords::create_new_application_password(
+				$user_id,
+				['name' => 'SiteCharter Connector']
+			);
 		if (is_wp_error($result)) {
 			add_settings_error('sitecharter', 'mint', $result->get_error_message());
 		} else {
 			[$new_password] = $result;
-			set_transient('sitecharter_new_app_password', $new_password, 120);
+			$integration_user = get_user_by('id', $user_id);
+			set_transient('sitecharter_new_app_password_' . get_current_user_id(), [
+				'username' => $integration_user instanceof WP_User ? $integration_user->user_login : '',
+				'password' => $new_password,
+			], 120);
 		}
 	}
 });
@@ -105,7 +174,9 @@ function sitecharter_render_settings_page(): void {
 		return;
 	}
 	$connected = (string) get_option(SITECHARTER_OPTION_KEY_HASH, '') !== '';
-	$fresh = get_transient('sitecharter_new_app_password'); ?>
+	$transient_key = 'sitecharter_new_app_password_' . get_current_user_id();
+	$fresh = get_transient($transient_key);
+	delete_transient($transient_key); ?>
 	<div class="wrap">
 		<h1>SiteCharter</h1>
 		<?php settings_errors('sitecharter'); ?>
@@ -131,12 +202,13 @@ function sitecharter_render_settings_page(): void {
 
 		<hr />
 		<h2><?php esc_html_e('Application password', 'sitecharter'); ?></h2>
-		<p><?php esc_html_e('Create a WordPress application password for your own account and paste it into SiteCharter. It lets SiteCharter write through the WordPress content API only — never the theme, the files, or raw options outside its bounds.', 'sitecharter'); ?></p>
+		<p><?php esc_html_e('Create an application password for a dedicated SiteCharter integration account. It can edit posts and pages, upload media, flush supported caches, and create backups. It cannot manage users, plugins, themes, or general WordPress settings.', 'sitecharter'); ?></p>
 
-		<?php if (is_string($fresh) && $fresh !== '') : ?>
+		<?php if (is_array($fresh) && ($fresh['password'] ?? '') !== '') : ?>
 			<p style="background:#fff;border-left:4px solid #266741;padding:12px">
-				<code style="font-size:16px"><?php echo esc_html($fresh); ?></code><br />
-				<?php esc_html_e('Copy it now — it is shown once and cannot be recovered.', 'sitecharter'); ?>
+				<?php esc_html_e('Username:', 'sitecharter'); ?> <code><?php echo esc_html((string) $fresh['username']); ?></code><br />
+				<?php esc_html_e('Application password:', 'sitecharter'); ?> <code style="font-size:16px"><?php echo esc_html((string) $fresh['password']); ?></code><br />
+				<?php esc_html_e('Copy both now — the password is shown once and cannot be recovered. Creating another password revokes the previous one.', 'sitecharter'); ?>
 			</p>
 		<?php endif; ?>
 
@@ -173,17 +245,17 @@ add_action('wp_head', function () {
 /* ─────────────────────── REST endpoints ─────────────────────── */
 
 /**
- * Shared permission check: WordPress core must authenticate an administrator
- * through an application password. The public connection key must also match
- * the site binding, but it is not treated as a second secret.
+ * Shared permission check: WordPress core must authenticate the dedicated
+ * integration account through an application password. The public connection
+ * key must also match the site binding, but it is not a second secret.
  */
 function sitecharter_rest_permission(): bool|WP_Error {
 	$key = sitecharter_request_key();
 	if (!sitecharter_key_matches($key)) {
 		return new WP_Error('sitecharter_forbidden', 'bad_key', ['status' => 403]);
 	}
-	if (!current_user_can('manage_options')) {
-		return new WP_Error('sitecharter_forbidden', 'need_admin', ['status' => 403]);
+	if (!current_user_can(SITECHARTER_CAPABILITY)) {
+		return new WP_Error('sitecharter_forbidden', 'need_sitecharter_capability', ['status' => 403]);
 	}
 	return true;
 }
@@ -199,7 +271,7 @@ add_action('rest_api_init', function () {
 			'site_url' => home_url(),
 			'hostname' => sitecharter_own_host(),
 			'wp_version' => get_bloginfo('version'),
-			'plugin_version' => '0.1.0',
+			'plugin_version' => '0.1.1',
 			'cache_plugins' => sitecharter_detect_cache_plugins(),
 			'db_export_available' => true,
 		],
@@ -214,7 +286,7 @@ add_action('rest_api_init', function () {
 
 	// Database export: the Layer-2 restore promise for REST transport.
 	register_rest_route('sitecharter/v1', '/db-export', [
-		'methods' => 'GET',
+		'methods' => 'POST',
 		'permission_callback' => 'sitecharter_rest_permission',
 		'callback' => 'sitecharter_handle_db_export',
 	]);
@@ -315,6 +387,9 @@ function sitecharter_handle_db_export() {
 	gzclose($gz);
 
 	$filename = 'sitecharter-db-' . gmdate('Ymd-His') . '.sql.gz';
+	header('Cache-Control: no-store, private');
+	header('Pragma: no-cache');
+	header('X-Content-Type-Options: nosniff');
 	header('Content-Type: application/gzip');
 	header('Content-Disposition: attachment; filename="' . $filename . '"');
 	header('Content-Length: ' . (string) filesize($tmp));

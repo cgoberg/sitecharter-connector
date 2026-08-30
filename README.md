@@ -7,7 +7,7 @@ without handing them theme access, FTP credentials, or a broad WordPress admin
 session. This plugin supplies the WordPress-specific connection layer:
 
 - installs SiteCharter's public verification marker without editing a theme;
-- creates a dedicated WordPress application password for the connection;
+- creates a constrained integration account and dedicated application password;
 - flushes supported WordPress caches after a verified change;
 - provides a gzipped database export for SiteCharter's backup layer;
 - exposes a handshake describing the connection's available capabilities.
@@ -32,12 +32,12 @@ The connection key appears in public page markup so SiteCharter can verify that
 the website owner installed the connector. It is a public identifier, not a
 password.
 
-Protected REST endpoints also require WordPress to authenticate an administrator
-through an application password. Treat that application password as a sensitive
-credential: it can authorize SiteCharter's connector endpoints, including a
-database export containing the site's WordPress tables. Revoke it immediately
-from **Users → Profile → Application Passwords** if the connection is no longer
-used or the credential may have been exposed.
+Protected REST endpoints require WordPress to authenticate the dedicated
+SiteCharter integration account through an application password. That account
+can edit posts and pages, upload media, flush supported caches, and create a
+database backup. It cannot manage users, plugins, themes, or general WordPress
+settings. Treat its application password as a sensitive credential and revoke
+it immediately if the connection is no longer used or may have been exposed.
 
 See [SECURITY.md](SECURITY.md) for reporting and operational guidance.
 
@@ -47,10 +47,10 @@ All routes live under `/wp-json/sitecharter/v1`:
 
 - `POST /handshake`
 - `POST /cache-flush`
-- `GET /db-export`
+- `POST /db-export`
 
 Requests must carry the matching `X-SiteCharter-Key` header and valid WordPress
-application-password authentication for an administrator.
+application-password authentication for the dedicated integration account.
 
 ## Development
 
@@ -63,4 +63,3 @@ build step. Test changes against a disposable WordPress site before using them
 on a production installation.
 
 GPL-2.0-or-later. Contributions are welcome.
-
